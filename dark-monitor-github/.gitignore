@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+venv/
+.venv/
+
+# Runtime data — may contain sensitive intel, never commit
+data/
+logs/
+config/targets.json
+config/remote_cache.json
+
+# Credentials — NEVER commit
+telegram_config.py
+.env
+*.env
+config/secrets.json
+
+# Backups
+backups/
+*.bak
+*.bak-*
+*backup*
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo

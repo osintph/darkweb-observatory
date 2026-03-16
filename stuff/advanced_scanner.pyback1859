@@ -1,0 +1,1755 @@
+import requests
+import socks
+import socket
+import datetime
+import urllib3
+import re
+import time
+import json
+import hashlib
+import os
+from bs4 import BeautifulSoup
+from urllib.parse import urlparse, urljoin
+
+# Suppress SSL warnings
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+# Telegram alerts
+try:
+    from telegram_alerts import (
+        alert_target_down, 
+        alert_target_recovery, 
+        alert_new_iocs,
+        alert_content_change, 
+        alert_uptime_drop,
+        send_scan_summary
+    )
+    ALERTS_ENABLED = True
+except ImportError:
+    ALERTS_ENABLED = False
+    print("[!] Telegram alerts disabled")
+
+# --- CONFIGURATION ---
+OUTPUT_HTML = "/var/www/html/index.html"
+OUTPUT_JSON = "/var/www/html/intelligence.json"
+DEEP_SCAN_DB = "/var/www/html/deep_scan_results.json"
+DEEP_SCAN_HTML = "/var/www/html/deep_scan_results.html"
+DEEP_SCAN_DIR = "/var/www/html/deep_scans"
+UPTIME_HISTORY = "/var/www/html/uptime_history.json"
+IOC_DATABASE = "/var/www/html/ioc_database.html"
+IOC_JSON = "/var/www/html/ioc_database.json"
+CHANGE_HISTORY = "/var/www/html/change_history.json"
+PREVIOUS_STATUS = "/var/www/html/previous_status.json"
+
+# Pre-configured Target List
+TARGETS = [
+    {
+        "name": "New York Times",
+        "url": "https://nytimesn7cgmftshazwhfgzm37qxb44r64ytbb2dj3x62d2lljsciiyd.onion",
+        "category": "news",
+        "deep_scan": False
+    },
+    {
+        "name": "BBC News",
+        "url": "https://www.bbcweb3hytmzhn5d532owbu6oqadra5z3ar726vq5kgwwn6aucdccrad.onion",
+        "category": "news",
+        "deep_scan": False
+    },
+    {
+        "name": "ProPublica",
+        "url": "https://p53lf57qovyuvwsc6xnrppyply3vtqm7l6pcobkmyqsiofyeznfu5uqd.onion",
+        "category": "news",
+        "deep_scan": False
+    },
+    {
+        "name": "CIA",
+        "url": "https://ciadotgov4sjwlzihbbgxnqg3xiyrg7so2r2o3lt5wz5ypk4sxyjstad.onion",
+        "category": "government",
+        "deep_scan": False
+    },
+    {
+        "name": "Facebook",
+        "url": "https://facebookwkhpilnemxj7asaniu7vnjjbiltxjqhye3mhbshg7kx5tfyd.onion",
+        "category": "social",
+        "deep_scan": False
+    },
+    {
+        "name": "The Guardian",
+        "url": "https://www.guardian2zotagl6tmjucg3lrhxdk4dw3lhbqnkvvkywawy3oqfoprid.onion",
+        "category": "news",
+        "deep_scan": False
+    },
+    {
+        "name": "DuckDuckGo",
+        "url": "https://duckduckgogg42xjoc72x3sjasowoarfbgcmvfimaftt6twagswzczad.onion",
+        "category": "search",
+        "deep_scan": False
+    },
+    {
+        "name": "Best Carding World",
+        "url": "http://bestteermb42clir6ux7xm76d4jjodh3fpahjqgbddbmfrgp4skg2wqd.onion/",
+        "category": "forums",
+        "deep_scan": True
+    },
+    {
+        "name": "Qilin Ransomware Blog",
+        "url": "http://ijzn3sicrcy7guixkzjkib4ukbiilwc3xhnmby4mcbccnsd7j2rekvqd.onion/",
+        "category": "ransomware",
+        "deep_scan": True
+    },
+    {
+        "name": "Dark Web Observatory",
+        "url": "http://u6q3zfc2i4w3dkjkpawbpgigkfthn7xebqhnpkzd7bufbysmpdud24ad.onion/",
+        "category": "monitoring",
+        "deep_scan": True
+    },
+]
+
+PROXIES = {
+    'http': 'socks5h://127.0.0.1:9050',
+    'https': 'socks5h://127.0.0.1:9050'
+}
+
+HEADERS = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; rv:109.0) Gecko/20100101 Firefox/115.0'
+}
+
+# Create deep scan directory
+os.makedirs(DEEP_SCAN_DIR, exist_ok=True)
+
+# ============== STATUS TRACKING ==============
+
+def load_previous_status():
+    """Load previous scan status"""
+    try:
+        with open(PREVIOUS_STATUS, 'r') as f:
+            return json.load(f)
+    except:
+        return {}
+
+def save_previous_status(status_data):
+    """Save current status for next scan"""
+    try:
+        with open(PREVIOUS_STATUS, 'w') as f:
+            json.dump(status_data, f, indent=2)
+    except Exception as e:
+        print(f"[!] Failed to save previous status: {e}")
+
+# ============== UPTIME TRACKING ==============
+
+def load_uptime_history():
+    """Load uptime history from file"""
+    try:
+        with open(UPTIME_HISTORY, 'r') as f:
+            return json.load(f)
+    except:
+        return {}
+
+def save_uptime_history(history):
+    """Save uptime history to file"""
+    try:
+        with open(UPTIME_HISTORY, 'w') as f:
+            json.dump(history, f, indent=2)
+    except Exception as e:
+        print(f"[!] Failed to save uptime history: {e}")
+
+def update_uptime_history(target_name, status):
+    """Update uptime history for a target"""
+    history = load_uptime_history()
+    
+    if target_name not in history:
+        history[target_name] = {'checks': [], 'total_up': 0, 'total_checks': 0}
+    
+    # Record this check
+    is_up = (status == 'UP')
+    timestamp = datetime.datetime.now().isoformat()
+    
+    history[target_name]['checks'].append({
+        'timestamp': timestamp,
+        'status': status,
+        'up': is_up
+    })
+    
+    # Keep only last 96 checks (24 hours if running every 15 min)
+    history[target_name]['checks'] = history[target_name]['checks'][-96:]
+    
+    # Calculate uptime percentage from history
+    checks = history[target_name]['checks']
+    if checks:
+        up_count = sum(1 for c in checks if c['up'])
+        uptime_percent = round((up_count / len(checks)) * 100, 1)
+        history[target_name]['uptime_24h'] = uptime_percent
+        history[target_name]['total_checks'] = len(checks)
+    else:
+        history[target_name]['uptime_24h'] = 0.0
+    
+    save_uptime_history(history)
+    return history[target_name]['uptime_24h']
+
+# ============== CHANGE DETECTION ==============
+
+def load_change_history():
+    """Load change detection history"""
+    try:
+        with open(CHANGE_HISTORY, 'r') as f:
+            return json.load(f)
+    except:
+        return {}
+
+def save_change_history(history):
+    """Save change detection history"""
+    try:
+        with open(CHANGE_HISTORY, 'w') as f:
+            json.dump(history, f, indent=2)
+    except Exception as e:
+        print(f"[!] Failed to save change history: {e}")
+
+def detect_changes(target_name, current_hash, current_technologies):
+    """Detect if target has changed"""
+    history = load_change_history()
+    timestamp = datetime.datetime.now().isoformat()
+    
+    if target_name not in history:
+        # First time seeing this target
+        history[target_name] = {
+            'first_seen': timestamp,
+            'last_hash': current_hash,
+            'last_technologies': current_technologies,
+            'last_changed': timestamp,
+            'change_count': 0,
+            'changes': []
+        }
+        save_change_history(history)
+        return {'changed': False, 'change_type': None, 'last_changed': timestamp}
+    
+    target_history = history[target_name]
+    previous_hash = target_history.get('last_hash')
+    previous_tech = target_history.get('last_technologies', [])
+    
+    changes_detected = []
+    
+    # Check page content change
+    if previous_hash and previous_hash != current_hash:
+        changes_detected.append('content')
+    
+    # Check technology stack changes
+    tech_added = set(current_technologies) - set(previous_tech)
+    tech_removed = set(previous_tech) - set(current_technologies)
+    
+    if tech_added or tech_removed:
+        changes_detected.append('technology')
+    
+    if changes_detected:
+        # Record the change
+        change_record = {
+            'timestamp': timestamp,
+            'change_types': changes_detected,
+            'previous_hash': previous_hash[:16] + '...' if previous_hash else None,
+            'new_hash': current_hash[:16] + '...',
+            'tech_added': list(tech_added),
+            'tech_removed': list(tech_removed)
+        }
+        
+        target_history['changes'].append(change_record)
+        target_history['changes'] = target_history['changes'][-20:]
+        target_history['last_hash'] = current_hash
+        target_history['last_technologies'] = current_technologies
+        target_history['last_changed'] = timestamp
+        target_history['change_count'] += 1
+        
+        save_change_history(history)
+        
+        print(f"    [!] CHANGE DETECTED: {', '.join(changes_detected)}")
+        
+        return {
+            'changed': True,
+            'change_type': ', '.join(changes_detected),
+            'last_changed': timestamp,
+            'details': change_record
+        }
+    else:
+        # No changes, update last seen
+        target_history['last_hash'] = current_hash
+        target_history['last_technologies'] = current_technologies
+        save_change_history(history)
+        
+        return {
+            'changed': False,
+            'change_type': None,
+            'last_changed': target_history.get('last_changed', timestamp)
+        }
+
+# ============== DEEP SCAN FUNCTIONS ==============
+
+def extract_page_title(html_content):
+    """Extract page title"""
+    try:
+        match = re.search(r'<title>(.*?)</title>', html_content, re.IGNORECASE | re.DOTALL)
+        if match:
+            return match.group(1).strip()[:60]
+    except:
+        pass
+    return "Unknown Title"
+
+def extract_emails(content):
+    """Extract email addresses"""
+    email_pattern = r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b'
+    emails = list(set(re.findall(email_pattern, content)))
+    return emails[:10]
+
+def extract_bitcoin_addresses(content):
+    """Extract Bitcoin addresses"""
+    btc_pattern = r'\b[13][a-km-zA-HJ-NP-Z1-9]{25,34}\b|bc1[a-z0-9]{39,59}\b'
+    btc_addrs = list(set(re.findall(btc_pattern, content)))
+    return btc_addrs[:5]
+
+def extract_pgp_keys(content):
+    """Extract PGP key fingerprints"""
+    pgp_blocks = re.findall(r'-----BEGIN PGP PUBLIC KEY BLOCK-----(.*?)-----END PGP PUBLIC KEY BLOCK-----', 
+                            content, re.DOTALL)
+    
+    fingerprints = []
+    for block in pgp_blocks[:3]:
+        key_id_match = re.search(r'[A-F0-9]{8,40}', block)
+        if key_id_match:
+            fingerprints.append(key_id_match.group(0))
+    
+    return fingerprints
+
+def extract_onion_links(html_content, base_url):
+    """Extract linked onion services"""
+    onion_pattern = r'[a-z2-7]{16,56}\.onion'
+    onions = list(set(re.findall(onion_pattern, html_content)))
+    
+    base_onion = urlparse(base_url).netloc
+    onions = [o for o in onions if o != base_onion]
+    
+    return onions[:10]
+
+def extract_ssh_info(headers):
+    """Check for SSH disclosure"""
+    ssh_header = headers.get('X-SSH-Fingerprint', '')
+    if ssh_header:
+        return {'disclosed': True, 'fingerprint': ssh_header}
+    return {'disclosed': False}
+
+def analyze_server_headers(headers):
+    """Analyze server configuration"""
+    analysis = {
+        'server': headers.get('Server', 'Unknown'),
+        'x_powered_by': headers.get('X-Powered-By', 'None'),
+        'backend': headers.get('X-Backend-Server', 'None'),
+        'real_ip_leaked': headers.get('X-Real-IP', 'No'),
+        'php_version': None,
+        'apache_version': None,
+        'nginx_version': None
+    }
+    
+    server = analysis['server']
+    if 'Apache' in server:
+        version_match = re.search(r'Apache/([\d.]+)', server)
+        if version_match:
+            analysis['apache_version'] = version_match.group(1)
+    
+    if 'nginx' in server:
+        version_match = re.search(r'nginx/([\d.]+)', server)
+        if version_match:
+            analysis['nginx_version'] = version_match.group(1)
+    
+    powered = analysis['x_powered_by']
+    if 'PHP' in powered:
+        version_match = re.search(r'PHP/([\d.]+)', powered)
+        if version_match:
+            analysis['php_version'] = version_match.group(1)
+    
+    return analysis
+
+def check_security_headers(headers):
+    """Check security headers"""
+    return {
+        'csp': headers.get('Content-Security-Policy', 'Missing'),
+        'x_frame_options': headers.get('X-Frame-Options', 'Missing'),
+        'xss_protection': headers.get('X-XSS-Protection', 'Missing'),
+        'hsts': headers.get('Strict-Transport-Security', 'Missing'),
+        'referrer_policy': headers.get('Referrer-Policy', 'Missing')
+    }
+
+def extract_forms(soup):
+    """Extract forms"""
+    forms = []
+    for form in soup.find_all('form')[:5]:
+        form_data = {
+            'action': form.get('action', 'N/A'),
+            'method': form.get('method', 'GET').upper(),
+            'inputs': []
+        }
+        
+        for input_field in form.find_all(['input', 'textarea']):
+            form_data['inputs'].append({
+                'name': input_field.get('name', 'unnamed'),
+                'type': input_field.get('type', 'text')
+            })
+        
+        forms.append(form_data)
+    
+    return forms
+
+def extract_javascript_files(soup, base_url):
+    """Extract JavaScript files"""
+    js_files = []
+    for script in soup.find_all('script', src=True)[:10]:
+        js_url = urljoin(base_url, script['src'])
+        js_files.append(js_url)
+    return js_files
+
+def calculate_page_hash(content):
+    """Calculate page hash"""
+    return hashlib.sha256(content.encode()).hexdigest()
+
+def detect_technologies(html_content, headers):
+    """Detect web technologies"""
+    techs = []
+    
+    if 'wp-content' in html_content or 'wordpress' in html_content.lower():
+        techs.append('WordPress')
+    if 'Drupal' in html_content:
+        techs.append('Drupal')
+    if 'joomla' in html_content.lower():
+        techs.append('Joomla')
+    if 'django' in html_content.lower():
+        techs.append('Django')
+    if 'Laravel' in html_content:
+        techs.append('Laravel')
+    if 'react' in html_content.lower():
+        techs.append('React')
+    if 'phpbb' in html_content.lower():
+        techs.append('phpBB')
+    
+    if 'PHP' in headers.get('X-Powered-By', ''):
+        techs.append('PHP')
+    if 'ASP.NET' in headers.get('X-Powered-By', ''):
+        techs.append('ASP.NET')
+    
+    return techs
+
+def analyze_cookies(headers):
+    """Analyze cookies"""
+    set_cookie = headers.get('Set-Cookie', '')
+    if not set_cookie:
+        return {'present': False}
+    
+    return {
+        'present': True,
+        'secure_flag': 'Secure' in set_cookie,
+        'httponly_flag': 'HttpOnly' in set_cookie,
+        'samesite': 'SameSite' in set_cookie
+    }
+
+def deep_scan_site(url, resp, soup):
+    """Comprehensive reconnaissance"""
+    
+    deep_data = {
+        'timestamp': datetime.datetime.now().isoformat(),
+        'url': url,
+        'page_hash': calculate_page_hash(resp.text),
+        'emails': extract_emails(resp.text),
+        'bitcoin_addresses': extract_bitcoin_addresses(resp.text),
+        'pgp_keys': extract_pgp_keys(resp.text),
+        'linked_onions': extract_onion_links(resp.text, url),
+        'server_analysis': analyze_server_headers(resp.headers),
+        'security_headers': check_security_headers(resp.headers),
+        'ssh_info': extract_ssh_info(resp.headers),
+        'cookies': analyze_cookies(resp.headers),
+        'technologies': detect_technologies(resp.text, resp.headers),
+        'forms': extract_forms(soup),
+        'javascript_files': extract_javascript_files(soup, url),
+        'content_length': len(resp.content),
+        'response_headers': dict(resp.headers),
+        'ssl_info': {
+            'enabled': url.startswith('https'),
+            'version': resp.raw.version if hasattr(resp.raw, 'version') else 'Unknown'
+        }
+    }
+    
+    return deep_data
+
+def sanitize_filename(name):
+    """Create safe filename from target name"""
+    return re.sub(r'[^a-zA-Z0-9_-]', '_', name).lower()
+
+def generate_individual_deep_scan_page(target_name, data, timestamp):
+    """Generate individual deep scan page for a target"""
+    
+    scan_time = data.get('timestamp', 'Unknown')
+    url = data.get('url', 'Unknown')
+    page_hash = data.get('page_hash', 'Unknown')[:16] + '...'
+    
+    html = f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Deep Scan: {target_name}</title>
+        <meta charset="UTF-8">
+        <style>
+            body {{ font-family: 'Courier New', monospace; background: #0d0d0d; color: #e0e0e0; padding: 20px; }}
+            h1 {{ color: #00ff00; text-transform: uppercase; border-bottom: 2px solid #333; padding-bottom: 10px; }}
+            h2 {{ color: #ffa500; border-bottom: 1px solid #444; padding-bottom: 8px; margin-top: 30px; }}
+            h3 {{ color: #00aaff; margin-top: 20px; font-size: 1.1em; }}
+            .back-link {{ color: #00aaff; text-decoration: none; }}
+            .back-link:hover {{ text-decoration: underline; }}
+            .stat-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 15px; margin: 15px 0; }}
+            .stat-box {{ background: #0a0a0a; padding: 12px; border: 1px solid #333; }}
+            .stat-label {{ color: #888; font-size: 0.85em; text-transform: uppercase; }}
+            .stat-value {{ color: #00ff00; font-size: 1.1em; margin-top: 5px; }}
+            .warning {{ color: #ff3333; }}
+            .success {{ color: #00ff00; }}
+            .info {{ color: #00aaff; }}
+            .code {{ background: #0a0a0a; padding: 10px; border-left: 3px solid #333; margin: 10px 0; overflow-x: auto; }}
+            .list-item {{ background: #0a0a0a; padding: 8px; margin: 5px 0; border-left: 2px solid #444; }}
+            table {{ border-collapse: collapse; width: 100%; margin: 15px 0; }}
+            th, td {{ border: 1px solid #333; padding: 10px; text-align: left; }}
+            th {{ background: #1a1a1a; color: #fff; }}
+            tr:nth-child(even) {{ background: #111; }}
+            .timestamp {{ color: #666; font-size: 0.9em; }}
+        </style>
+    </head>
+    <body>
+        <h1>Deep Scan Report: {target_name}</h1>
+        <p><a href="../index.html" class="back-link">&larr; Back to Dashboard</a> | <a href="../deep_scan_results.html" class="back-link">All Deep Scans</a> | <a href="../ioc_database.html" class="back-link">IOC Database</a> | Last Updated: {timestamp}</p>
+        
+        <p class="timestamp">Scanned: {scan_time}</p>
+        <div class="code">URL: {url}</div>
+        <div class="code">Page Hash: {page_hash}</div>
+        
+        <h2>Intelligence Summary</h2>
+        <div class="stat-grid">
+            <div class="stat-box">
+                <div class="stat-label">Email Addresses</div>
+                <div class="stat-value {'warning' if data.get('emails') else ''}">{len(data.get('emails', []))}</div>
+            </div>
+            <div class="stat-box">
+                <div class="stat-label">Bitcoin Addresses</div>
+                <div class="stat-value {'warning' if data.get('bitcoin_addresses') else ''}">{len(data.get('bitcoin_addresses', []))}</div>
+            </div>
+            <div class="stat-box">
+                <div class="stat-label">PGP Keys</div>
+                <div class="stat-value {'warning' if data.get('pgp_keys') else ''}">{len(data.get('pgp_keys', []))}</div>
+            </div>
+            <div class="stat-box">
+                <div class="stat-label">Linked Onions</div>
+                <div class="stat-value {'info' if data.get('linked_onions') else ''}">{len(data.get('linked_onions', []))}</div>
+            </div>
+            <div class="stat-box">
+                <div class="stat-label">Forms Detected</div>
+                <div class="stat-value">{len(data.get('forms', []))}</div>
+            </div>
+            <div class="stat-box">
+                <div class="stat-label">Content Size</div>
+                <div class="stat-value">{data.get('content_length', 0):,} bytes</div>
+            </div>
+        </div>
+    """
+    
+    # IOCs - Emails
+    if data.get('emails'):
+        html += "<h2>Extracted Email Addresses (IOCs)</h2>"
+        for email in data.get('emails', []):
+            html += f'<div class="list-item warning">{email}</div>'
+    
+    # IOCs - Bitcoin
+    if data.get('bitcoin_addresses'):
+        html += "<h2>Bitcoin Addresses Detected (IOCs)</h2>"
+        for btc in data.get('bitcoin_addresses', []):
+            html += f'<div class="list-item warning">{btc}</div>'
+    
+    # IOCs - PGP Keys
+    if data.get('pgp_keys'):
+        html += "<h2>PGP Key Fingerprints (IOCs)</h2>"
+        for pgp in data.get('pgp_keys', []):
+            html += f'<div class="list-item warning">{pgp}</div>'
+    
+    # Linked Onions
+    if data.get('linked_onions'):
+        html += "<h2>Linked Onion Services (Network Mapping)</h2>"
+        for onion in data.get('linked_onions', []):
+            html += f'<div class="list-item info">{onion}</div>'
+    
+    # Server Analysis
+    server_data = data.get('server_analysis', {})
+    html += f"""
+        <h2>Server Infrastructure</h2>
+        <table>
+            <tr><th>Property</th><th>Value</th><th>Assessment</th></tr>
+            <tr><td>Server</td><td>{server_data.get('server', 'Unknown')}</td><td>{'<span class="success">Version hidden (good OPSEC)</span>' if server_data.get('server') == 'Apache' and not server_data.get('apache_version') else '<span class="warning">Version exposed</span>' if server_data.get('apache_version') or server_data.get('nginx_version') else '<span class="success">Version hidden</span>'}</td></tr>
+            <tr><td>Backend</td><td>{server_data.get('backend', 'None')}</td><td>{'<span class="warning">Backend server disclosed</span>' if server_data.get('backend') != 'None' else '<span class="success">Not disclosed</span>'}</td></tr>
+            <tr><td>Real IP Leaked</td><td>{server_data.get('real_ip_leaked', 'No')}</td><td>{'<span class="warning">Critical OPSEC failure!</span>' if server_data.get('real_ip_leaked') != 'No' else '<span class="success">Not leaked</span>'}</td></tr>
+            <tr><td>PHP Version</td><td>{server_data.get('php_version') or 'Not disclosed'}</td><td>{'<span class="warning">Version exposed</span>' if server_data.get('php_version') else '<span class="success">Hidden</span>'}</td></tr>
+        </table>
+    """
+    
+    # Security Headers
+    sec_headers = data.get('security_headers', {})
+    missing_headers = sum(1 for v in sec_headers.values() if v == 'Missing')
+    html += f"""
+        <h2>Security Posture ({missing_headers}/5 headers missing)</h2>
+        <table>
+            <tr><th>Header</th><th>Status</th></tr>
+            <tr><td>Content-Security-Policy</td><td><span class="{'warning' if sec_headers.get('csp') == 'Missing' else 'success'}">{sec_headers.get('csp', 'Missing')}</span></td></tr>
+            <tr><td>X-Frame-Options</td><td><span class="{'warning' if sec_headers.get('x_frame_options') == 'Missing' else 'success'}">{sec_headers.get('x_frame_options', 'Missing')}</span></td></tr>
+            <tr><td>X-XSS-Protection</td><td><span class="{'warning' if sec_headers.get('xss_protection') == 'Missing' else 'success'}">{sec_headers.get('xss_protection', 'Missing')}</span></td></tr>
+            <tr><td>Strict-Transport-Security</td><td><span class="{'warning' if sec_headers.get('hsts') == 'Missing' else 'success'}">{sec_headers.get('hsts', 'Missing')}</span></td></tr>
+            <tr><td>Referrer-Policy</td><td><span class="{'warning' if sec_headers.get('referrer_policy') == 'Missing' else 'success'}">{sec_headers.get('referrer_policy', 'Missing')}</span></td></tr>
+        </table>
+    """
+    
+    # Cookie Analysis
+    cookies = data.get('cookies', {})
+    if cookies.get('present'):
+        html += f"""
+            <h2>Cookie Security Analysis</h2>
+            <table>
+                <tr><th>Property</th><th>Status</th><th>Assessment</th></tr>
+                <tr><td>Secure Flag</td><td>{'<span class="success">Yes</span>' if cookies.get('secure_flag') else '<span class="warning">No</span>'}</td><td>{'Protected' if cookies.get('secure_flag') else 'Vulnerable to interception'}</td></tr>
+                <tr><td>HttpOnly Flag</td><td>{'<span class="success">Yes</span>' if cookies.get('httponly_flag') else '<span class="warning">No</span>'}</td><td>{'XSS protected' if cookies.get('httponly_flag') else 'Vulnerable to XSS'}</td></tr>
+                <tr><td>SameSite</td><td>{'<span class="success">Yes</span>' if cookies.get('samesite') else '<span class="warning">No</span>'}</td><td>{'CSRF protected' if cookies.get('samesite') else 'Vulnerable to CSRF'}</td></tr>
+            </table>
+        """
+    
+    # Technologies
+    if data.get('technologies'):
+        html += "<h2>Technologies Detected</h2>"
+        for tech in data.get('technologies', []):
+            html += f'<div class="list-item">{tech}</div>'
+    
+    # Forms
+    if data.get('forms'):
+        html += f"<h2>Forms Discovered ({len(data.get('forms', []))} forms)</h2>"
+        for idx, form in enumerate(data.get('forms', []), 1):
+            html += f"""
+                <div class="list-item">
+                    <strong>Form {idx}: {form.get('method', 'GET')} → {form.get('action', 'N/A')}</strong><br>
+                    Inputs: {', '.join([f"{inp.get('name')} ({inp.get('type')})" for inp in form.get('inputs', [])])}
+                </div>
+            """
+    
+    # JavaScript Files
+    if data.get('javascript_files'):
+        html += f"<h2>JavaScript Assets ({len(data.get('javascript_files', []))} files)</h2>"
+        for js in data.get('javascript_files', []):
+            js_name = js.split('/')[-1]
+            html += f'<div class="list-item"><span class="info">{js_name}</span></div>'
+    
+    # SSL/TLS
+    ssl_info = data.get('ssl_info', {})
+    html += f"""
+        <h2>SSL/TLS Configuration</h2>
+        <table>
+            <tr><th>Property</th><th>Value</th></tr>
+            <tr><td>HTTPS Enabled</td><td>{'<span class="success">Yes</span>' if ssl_info.get('enabled') else '<span class="warning">No (HTTP only)</span>'}</td></tr>
+            <tr><td>TLS Version</td><td>{ssl_info.get('version', 'Unknown')}</td></tr>
+        </table>
+    """
+    
+    html += """
+        <p style="margin-top:50px; font-size: 0.8em; color: #555;">
+            <i>Automated Threat Intelligence Sentinel | Deep Reconnaissance Module</i>
+        </p>
+    </body>
+    </html>
+    """
+    
+    return html
+
+def generate_deep_scan_html(deep_scan_data, timestamp):
+    """Generate overview page for all deep scans"""
+    
+    html = f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Deep Scan Intelligence Database - Overview</title>
+        <meta charset="UTF-8">
+        <style>
+            body {{ font-family: 'Courier New', monospace; background: #0d0d0d; color: #e0e0e0; padding: 20px; }}
+            h1 {{ color: #00ff00; text-transform: uppercase; border-bottom: 2px solid #333; padding-bottom: 10px; }}
+            .back-link {{ color: #00aaff; text-decoration: none; }}
+            .back-link:hover {{ text-decoration: underline; }}
+            .target-card {{ background: #1a1a1a; padding: 20px; margin: 20px 0; border-left: 4px solid #00ff00; }}
+            .target-card h2 {{ color: #ffa500; margin-top: 0; }}
+            .stat-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; margin: 15px 0; }}
+            .stat-box {{ background: #0a0a0a; padding: 10px; border: 1px solid #333; text-align: center; }}
+            .stat-label {{ color: #888; font-size: 0.8em; }}
+            .stat-value {{ color: #00ff00; font-size: 1.2em; font-weight: bold; }}
+            .view-btn {{ display: inline-block; background: #003300; color: #00ff00; padding: 8px 16px; text-decoration: none; border: 1px solid #00ff00; margin-top: 15px; }}
+            .view-btn:hover {{ background: #004400; }}
+        </style>
+    </head>
+    <body>
+        <h1>Deep Scan Intelligence Database - Overview</h1>
+        <p><a href="index.html" class="back-link">&larr; Back to Dashboard</a> | <a href="ioc_database.html" class="back-link">IOC Database</a> | Last Updated: {timestamp}</p>
+    """
+    
+    for target_name, data in deep_scan_data.items():
+        filename = sanitize_filename(target_name)
+        scan_time = data.get('timestamp', 'Unknown')
+        
+        html += f"""
+        <div class="target-card">
+            <h2>{target_name}</h2>
+            <p style="color: #666; font-size: 0.9em;">Last Scan: {scan_time}</p>
+            
+            <div class="stat-grid">
+                <div class="stat-box">
+                    <div class="stat-label">Emails</div>
+                    <div class="stat-value">{len(data.get('emails', []))}</div>
+                </div>
+                <div class="stat-box">
+                    <div class="stat-label">BTC Addresses</div>
+                    <div class="stat-value">{len(data.get('bitcoin_addresses', []))}</div>
+                </div>
+                <div class="stat-box">
+                    <div class="stat-label">PGP Keys</div>
+                    <div class="stat-value">{len(data.get('pgp_keys', []))}</div>
+                </div>
+                <div class="stat-box">
+                    <div class="stat-label">Linked Onions</div>
+                    <div class="stat-value">{len(data.get('linked_onions', []))}</div>
+                </div>
+                <div class="stat-box">
+                    <div class="stat-label">Forms</div>
+                    <div class="stat-value">{len(data.get('forms', []))}</div>
+                </div>
+                <div class="stat-box">
+                    <div class="stat-label">Technologies</div>
+                    <div class="stat-value">{len(data.get('technologies', []))}</div>
+                </div>
+            </div>
+            
+            <a href="deep_scans/{filename}.html" class="view-btn">View Full Report →</a>
+        </div>
+        """
+    
+    html += """
+        <p style="margin-top:50px; font-size: 0.8em; color: #555;">
+            <i>Automated Threat Intelligence Sentinel | Deep Reconnaissance Module</i>
+        </p>
+    </body>
+    </html>
+    """
+    
+    return html
+
+# ============== IOC AGGREGATION ==============
+
+def generate_ioc_database(deep_scan_data, timestamp):
+    """Generate master IOC aggregation page"""
+    
+    # Aggregate all IOCs
+    all_emails = []
+    all_btc = []
+    all_pgp = []
+    all_onions = []
+    
+    for target_name, data in deep_scan_data.items():
+        for email in data.get('emails', []):
+            all_emails.append({'ioc': email, 'source': target_name, 'type': 'email'})
+        for btc in data.get('bitcoin_addresses', []):
+            all_btc.append({'ioc': btc, 'source': target_name, 'type': 'bitcoin'})
+        for pgp in data.get('pgp_keys', []):
+            all_pgp.append({'ioc': pgp, 'source': target_name, 'type': 'pgp'})
+        for onion in data.get('linked_onions', []):
+            all_onions.append({'ioc': onion, 'source': target_name, 'type': 'onion'})
+    
+    # Save JSON version
+    ioc_json_data = {
+        'generated': timestamp,
+        'total_iocs': len(all_emails) + len(all_btc) + len(all_pgp) + len(all_onions),
+        'emails': all_emails,
+        'bitcoin_addresses': all_btc,
+        'pgp_keys': all_pgp,
+        'linked_onions': all_onions
+    }
+    
+    try:
+        with open(IOC_JSON, 'w') as f:
+            json.dump(ioc_json_data, f, indent=2)
+    except Exception as e:
+        print(f"[!] Failed to save IOC JSON: {e}")
+    
+    # Generate HTML
+    html = f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>IOC Database - Master Intelligence Feed</title>
+        <meta charset="UTF-8">
+        <style>
+            body {{ font-family: 'Courier New', monospace; background: #0d0d0d; color: #e0e0e0; padding: 20px; }}
+            h1 {{ color: #00ff00; text-transform: uppercase; border-bottom: 2px solid #333; padding-bottom: 10px; }}
+            h2 {{ color: #ffa500; margin-top: 30px; border-bottom: 1px solid #444; padding-bottom: 8px; }}
+            .back-link {{ color: #00aaff; text-decoration: none; }}
+            .back-link:hover {{ text-decoration: underline; }}
+            .summary-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 15px; margin: 20px 0; }}
+            .summary-box {{ background: #1a1a1a; padding: 15px; border-left: 3px solid #ff3333; }}
+            .summary-label {{ color: #888; font-size: 0.85em; text-transform: uppercase; }}
+            .summary-value {{ color: #ff3333; font-size: 1.8em; font-weight: bold; margin-top: 5px; }}
+            .search-box {{ background: #1a1a1a; padding: 20px; margin: 20px 0; border: 1px solid #333; }}
+            .search-input {{ width: 100%; background: #0a0a0a; border: 1px solid #333; color: #e0e0e0; padding: 10px; font-family: 'Courier New', monospace; font-size: 1em; }}
+            .search-input:focus {{ border-color: #00ff00; outline: none; }}
+            table {{ border-collapse: collapse; width: 100%; margin: 20px 0; }}
+            th, td {{ border: 1px solid #333; padding: 10px; text-align: left; }}
+            th {{ background: #1a1a1a; color: #fff; text-transform: uppercase; position: sticky; top: 0; }}
+            tr:nth-child(even) {{ background: #111; }}
+            tr.hidden {{ display: none; }}
+            .ioc-email {{ color: #ff3333; }}
+            .ioc-btc {{ color: #ffa500; }}
+            .ioc-pgp {{ color: #00aaff; }}
+            .ioc-onion {{ color: #888; }}
+            .source-tag {{ background: #0a0a0a; padding: 3px 8px; border-radius: 3px; font-size: 0.85em; }}
+            .download-btn {{ display: inline-block; background: #003300; color: #00ff00; padding: 10px 20px; text-decoration: none; border: 1px solid #00ff00; margin: 10px 5px; cursor: pointer; }}
+            .download-btn:hover {{ background: #004400; }}
+        </style>
+    </head>
+    <body>
+        <h1>🔍 IOC Database - Master Intelligence Feed</h1>
+        <p><a href="index.html" class="back-link">&larr; Back to Dashboard</a> | <a href="deep_scan_results.html" class="back-link">Deep Scan Overview</a> | Last Updated: {timestamp}</p>
+        
+        <div class="summary-grid">
+            <div class="summary-box">
+                <div class="summary-label">Total IOCs</div>
+                <div class="summary-value">{len(all_emails) + len(all_btc) + len(all_pgp) + len(all_onions)}</div>
+            </div>
+            <div class="summary-box">
+                <div class="summary-label">Email Addresses</div>
+                <div class="summary-value">{len(all_emails)}</div>
+            </div>
+            <div class="summary-box">
+                <div class="summary-label">Bitcoin Addresses</div>
+                <div class="summary-value">{len(all_btc)}</div>
+            </div>
+            <div class="summary-box">
+                <div class="summary-label">PGP Keys</div>
+                <div class="summary-value">{len(all_pgp)}</div>
+            </div>
+            <div class="summary-box">
+                <div class="summary-label">Linked Onions</div>
+                <div class="summary-value">{len(all_onions)}</div>
+            </div>
+        </div>
+        
+        <div>
+            <a href="ioc_database.json" class="download-btn" download>⬇ Download JSON</a>
+            <button onclick="exportCSV()" class="download-btn">⬇ Export to CSV</button>
+        </div>
+        
+        <div class="search-box">
+            <input type="text" id="searchInput" class="search-input" placeholder="🔍 Search IOCs (email, Bitcoin address, PGP key, onion domain, or source target)..." onkeyup="searchIOCs()">
+        </div>
+    """
+    
+    # Email Addresses
+    if all_emails:
+        html += f"""
+        <h2>📧 Email Addresses ({len(all_emails)})</h2>
+        <table id="emailTable">
+            <thead>
+                <tr>
+                    <th style="width: 50%">Email Address</th>
+                    <th style="width: 30%">Source Target</th>
+                    <th style="width: 20%">Type</th>
+                </tr>
+            </thead>
+            <tbody>
+        """
+        for item in all_emails:
+            html += f"""
+                <tr data-ioc="{item['ioc'].lower()}" data-source="{item['source'].lower()}">
+                    <td class="ioc-email">{item['ioc']}</td>
+                    <td><span class="source-tag">{item['source']}</span></td>
+                    <td>Email</td>
+                </tr>
+            """
+        html += "</tbody></table>"
+    
+    # Bitcoin Addresses
+    if all_btc:
+        html += f"""
+        <h2>₿ Bitcoin Addresses ({len(all_btc)})</h2>
+        <table id="btcTable">
+            <thead>
+                <tr>
+                    <th style="width: 50%">Bitcoin Address</th>
+                    <th style="width: 30%">Source Target</th>
+                    <th style="width: 20%">Type</th>
+                </tr>
+            </thead>
+            <tbody>
+        """
+        for item in all_btc:
+            html += f"""
+                <tr data-ioc="{item['ioc'].lower()}" data-source="{item['source'].lower()}">
+                    <td class="ioc-btc">{item['ioc']}</td>
+                    <td><span class="source-tag">{item['source']}</span></td>
+                    <td>Bitcoin</td>
+                </tr>
+            """
+        html += "</tbody></table>"
+    
+    # PGP Keys
+    if all_pgp:
+        html += f"""
+        <h2>🔐 PGP Key Fingerprints ({len(all_pgp)})</h2>
+        <table id="pgpTable">
+            <thead>
+                <tr>
+                    <th style="width: 50%">PGP Fingerprint</th>
+                    <th style="width: 30%">Source Target</th>
+                    <th style="width: 20%">Type</th>
+                </tr>
+            </thead>
+            <tbody>
+        """
+        for item in all_pgp:
+            html += f"""
+                <tr data-ioc="{item['ioc'].lower()}" data-source="{item['source'].lower()}">
+                    <td class="ioc-pgp">{item['ioc']}</td>
+                    <td><span class="source-tag">{item['source']}</span></td>
+                    <td>PGP Key</td>
+                </tr>
+            """
+        html += "</tbody></table>"
+    
+    # Linked Onions
+    if all_onions:
+        html += f"""
+        <h2>🧅 Linked Onion Services ({len(all_onions)})</h2>
+        <table id="onionTable">
+            <thead>
+                <tr>
+                    <th style="width: 50%">Onion Domain</th>
+                    <th style="width: 30%">Discovered On</th>
+                    <th style="width: 20%">Type</th>
+                </tr>
+            </thead>
+            <tbody>
+        """
+        for item in all_onions:
+            html += f"""
+                <tr data-ioc="{item['ioc'].lower()}" data-source="{item['source'].lower()}">
+                    <td class="ioc-onion">{item['ioc']}</td>
+                    <td><span class="source-tag">{item['source']}</span></td>
+                    <td>Onion Link</td>
+                </tr>
+            """
+        html += "</tbody></table>"
+    
+    html += """
+        <p style="margin-top:50px; font-size: 0.8em; color: #555;">
+            <i>Automated Threat Intelligence Sentinel | IOC Aggregation Module</i>
+        </p>
+        
+        <script>
+        function searchIOCs() {
+            const searchTerm = document.getElementById('searchInput').value.toLowerCase();
+            const allRows = document.querySelectorAll('table tbody tr');
+            
+            allRows.forEach(row => {
+                const ioc = row.dataset.ioc || '';
+                const source = row.dataset.source || '';
+                
+                if (ioc.includes(searchTerm) || source.includes(searchTerm)) {
+                    row.classList.remove('hidden');
+                } else{
+                    row.classList.add('hidden');
+                }
+            });
+        }
+        
+        function exportCSV() {
+            let csv = 'IOC,Type,Source Target\\n';
+            const allRows = document.querySelectorAll('table tbody tr');
+            
+            allRows.forEach(row => {
+                if (!row.classList.contains('hidden')) {
+                    const cols = row.querySelectorAll('td');
+                    if (cols.length >= 3) {
+                        const ioc = cols[0].textContent.trim();
+                        const source = cols[1].textContent.trim();
+                        const type = cols[2].textContent.trim();
+                        csv += `"${ioc}","${type}","${source}"\\n`;
+                    }
+                }
+            });
+            
+            const blob = new Blob([csv], { type: 'text/csv' });
+            const url = window.URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = 'ioc_database.csv';
+            a.click();
+        }
+        </script>
+    </body>
+    </html>
+    """
+    
+    return html
+
+# ============== MAIN SCANNING ==============
+
+def check_site(target):
+    """Main site checking"""
+    url = target['url']
+    
+    try:
+        start_time = time.time()
+        resp = requests.get(url, proxies=PROXIES, headers=HEADERS, timeout=60, verify=False)
+        latency = round(time.time() - start_time, 2)
+        
+        soup = BeautifulSoup(resp.text, 'html.parser')
+        title = extract_page_title(resp.text)
+        server = resp.headers.get('Server', 'Unknown')
+        
+        result = {
+            'status': None,
+            'status_detail': None,
+            'color': None,
+            'latency': f"{latency}s",
+            'title': title,
+            'server': server,
+            'deep_data': None,
+            'http_code': resp.status_code
+        }
+        
+        if target.get('deep_scan', False):
+            print(f"    [DEEP SCAN ENABLED]")
+            result['deep_data'] = deep_scan_site(url, resp, soup)
+        
+        if 200 <= resp.status_code < 300:
+            result['status'] = "UP"
+            result['status_detail'] = f"HTTP {resp.status_code}"
+            result['color'] = "green"
+        elif resp.status_code == 403:
+            result['status'] = "ISSUES"
+            result['status_detail'] = "HTTP 403 Forbidden"
+            result['color'] = "orange"
+            result['title'] = "Access Denied (403)"
+        elif resp.status_code == 401:
+            result['status'] = "ISSUES"
+            result['status_detail'] = "HTTP 401 Unauthorized"
+            result['color'] = "orange"
+            result['title'] = "Authentication Required (401)"
+        elif resp.status_code == 404:
+            result['status'] = "ISSUES"
+            result['status_detail'] = "HTTP 404 Not Found"
+            result['color'] = "orange"
+            result['title'] = "Page Not Found (404)"
+        elif resp.status_code >= 500:
+            result['status'] = "ISSUES"
+            result['status_detail'] = f"HTTP {resp.status_code} Server Error"
+            result['color'] = "orange"
+            result['title'] = f"Server Error ({resp.status_code})"
+        else:
+            result['status'] = "ISSUES"
+            result['status_detail'] = f"HTTP {resp.status_code}"
+            result['color'] = "orange"
+            result['title'] = f"Status {resp.status_code}"
+        
+        return result
+            
+    except requests.exceptions.ConnectionError:
+        return {
+            'status': "DOWN",
+            'status_detail': "Connection Failed",
+            'color': "red",
+            'latency': "-",
+            'title': "Connection Failed",
+            'server': "-",
+            'deep_data': None,
+            'http_code': None
+        }
+    except requests.exceptions.Timeout:
+        return {
+            'status': "DOWN",
+            'status_detail': "Timeout (>60s)",
+            'color': "red",
+            'latency': ">60s",
+            'title': "Timed Out",
+            'server': "-",
+            'deep_data': None,
+            'http_code': None
+        }
+    except Exception as e:
+        return {
+            'status': "ERROR",
+            'status_detail': str(e)[:40],
+            'color': "red",
+            'latency': "-",
+            'title': str(e)[:30],
+            'server': "-",
+            'deep_data': None,
+            'http_code': None
+        }
+
+def load_previous_scans():
+    """Load previous deep scan results"""
+    try:
+        with open(DEEP_SCAN_DB, 'r') as f:
+            return json.load(f)
+    except:
+        return {}
+
+def save_deep_scan_results(all_deep_data):
+    """Save deep scan results"""
+    try:
+        with open(DEEP_SCAN_DB, 'w') as f:
+            json.dump(all_deep_data, f, indent=2)
+    except Exception as e:
+        print(f"[!] Failed to save deep scan DB: {e}")
+
+def calculate_intelligence_summary(all_results, deep_scan_data):
+    """Calculate aggregate intelligence metrics"""
+    
+    total_targets = len(all_results)
+    up_targets = sum(1 for r in all_results if r['result']['status'] == 'UP')
+    down_targets = sum(1 for r in all_results if r['result']['status'] == 'DOWN')
+    issues_targets = sum(1 for r in all_results if 'ISSUES' in r['result']['status'])
+    
+    deep_scan_count = sum(1 for r in all_results if r['deep_scan_enabled'])
+    
+    # IOC counts
+    total_emails = 0
+    total_btc = 0
+    total_pgp = 0
+    total_linked_onions = 0
+    
+    for target_name, data in deep_scan_data.items():
+        total_emails += len(data.get('emails', []))
+        total_btc += len(data.get('bitcoin_addresses', []))
+        total_pgp += len(data.get('pgp_keys', []))
+        total_linked_onions += len(data.get('linked_onions', []))
+    
+    # Calculate average latency (exclude failures)
+    latencies = []
+    for r in all_results:
+        lat = r['result']['latency']
+        if lat != '-' and '>' not in lat:
+            try:
+                latencies.append(float(lat.replace('s', '')))
+            except:
+                pass
+    
+    avg_latency = round(sum(latencies) / len(latencies), 2) if latencies else 0
+    
+    # Category breakdown
+    categories = {}
+    for r in all_results:
+        cat = r['category']
+        categories[cat] = categories.get(cat, 0) + 1
+    
+    uptime_percentage = round((up_targets / total_targets) * 100, 1) if total_targets > 0 else 0
+    
+    # Count changes detected
+    changes_detected = sum(1 for r in all_results if r.get('change_info', {}).get('changed', False))
+    
+    return {
+        'total_targets': total_targets,
+        'up_targets': up_targets,
+        'down_targets': down_targets,
+        'issues_targets': issues_targets,
+        'uptime_percentage': uptime_percentage,
+        'deep_scan_count': deep_scan_count,
+        'total_iocs': total_emails + total_btc + total_pgp,
+        'total_emails': total_emails,
+        'total_btc': total_btc,
+        'total_pgp': total_pgp,
+        'total_linked_onions': total_linked_onions,
+        'avg_latency': avg_latency,
+        'categories': categories,
+        'changes_detected': changes_detected
+    }
+
+def generate_report():
+    """Generate HTML dashboard and JSON feed"""
+    
+    now = datetime.datetime.now().astimezone()
+    timestamp = now.strftime("%Y-%m-%d %H:%M %Z")
+    
+    print(f"[*] Starting threat intelligence scan at {timestamp}")
+    if ALERTS_ENABLED:
+        print(f"[*] Telegram alerts ENABLED")
+    
+    all_results = []
+    deep_scan_data = load_previous_scans()
+    previous_status = load_previous_status()
+    
+    # SCAN ALL TARGETS
+    for target in TARGETS:
+        print(f"  > Scanning {target['name']} [{target.get('category', 'unknown')}]...")
+        
+        result = check_site(target)
+        
+        print(f"    Result: {result['status']} ({result['latency']})")
+        
+        # Get previous status
+        prev_status = previous_status.get(target['name'], {}).get('status', 'UNKNOWN')
+        
+        # Update uptime history
+        uptime_24h = update_uptime_history(target['name'], result['status'])
+        print(f"    24h Uptime: {uptime_24h}%")
+        
+        # TELEGRAM ALERTS - Status changes
+        if ALERTS_ENABLED:
+            # Alert on DOWN
+            if result['status'] == 'DOWN' and prev_status != 'DOWN':
+                alert_target_down(target['name'], target['url'], result.get('status_detail', 'Unknown'))
+            
+            # Alert on recovery
+            if result['status'] == 'UP' and prev_status == 'DOWN':
+                alert_target_recovery(target['name'], target['url'])
+            
+            # Alert on uptime drop
+            if uptime_24h < 80.0:
+                alert_uptime_drop(target['name'], uptime_24h)
+        
+        # Change detection
+        # Initialize change_info before potential deep scan update to avoid NameError
+        change_info = {'changed': False, 'change_type': None, 'last_changed': timestamp}
+        
+        if result['deep_data']:
+            deep_scan_data[target['name']] = result['deep_data']
+            print(f"    [+] Deep scan complete - {len(result['deep_data'].get('emails', []))} emails, "
+                  f"{len(result['deep_data'].get('bitcoin_addresses', []))} BTC addresses, "
+                  f"{len(result['deep_data'].get('linked_onions', []))} linked onions")
+            
+            # Detect changes
+            change_info = detect_changes(
+                target['name'],
+                result['deep_data'].get('page_hash'),
+                result['deep_data'].get('technologies', [])
+            )
+            
+            # TELEGRAM ALERTS - Changes
+            if ALERTS_ENABLED and change_info.get('changed'):
+                alert_content_change(target['name'], target['url'], change_info.get('change_type'))
+            
+            # TELEGRAM ALERTS - New IOCs
+            if ALERTS_ENABLED:
+                ioc_summary = {
+                    'emails': result['deep_data'].get('emails', []),
+                    'bitcoin': result['deep_data'].get('bitcoin_addresses', []),
+                    'pgp': result['deep_data'].get('pgp_keys', [])
+                }
+                if any(ioc_summary.values()):
+                    alert_new_iocs(target['name'], ioc_summary)
+        
+        all_results.append({
+            'name': target['name'],
+            'url': target['url'],
+            'category': target.get('category', 'unknown'),
+            'status': result['status'],
+            'latency_seconds': float(result['latency'].replace('s', '').replace('-', '0').replace('>', '')),
+            'server': result['server'],
+            'timestamp': timestamp,
+            'deep_scan_enabled': target.get('deep_scan', False),
+            'uptime_24h': uptime_24h,
+            'change_info': change_info,
+            'result': result
+        })
+    
+    # Save current status for next scan
+    current_status = {item['name']: {'status': item['status']} for item in all_results}
+    save_previous_status(current_status)
+    
+    # Calculate intelligence summary
+    intel_summary = calculate_intelligence_summary(all_results, deep_scan_data)
+    
+    # TELEGRAM - Send scan summary
+    if ALERTS_ENABLED:
+        send_scan_summary(intel_summary)
+    
+    # Save deep scan database and generate individual pages
+    if deep_scan_data:
+        save_deep_scan_results(deep_scan_data)
+        print(f"[+] Deep scan database updated with {len(deep_scan_data)} entries")
+        
+        # Generate individual deep scan pages
+        for target_name, data in deep_scan_data.items():
+            filename = sanitize_filename(target_name)
+            individual_html = generate_individual_deep_scan_page(target_name, data, timestamp)
+            try:
+                with open(f"{DEEP_SCAN_DIR}/{filename}.html", 'w') as f:
+                    f.write(individual_html)
+                print(f"    [+] Generated individual page: {filename}.html")
+            except Exception as e:
+                print(f"    [!] Failed to write {filename}.html: {e}")
+        
+        # Generate overview HTML
+        deep_scan_html = generate_deep_scan_html(deep_scan_data, timestamp)
+        try:
+            with open(DEEP_SCAN_HTML, 'w') as f:
+                f.write(deep_scan_html)
+            print(f"[+] Deep scan overview HTML generated")
+        except Exception as e:
+            print(f"[!] Failed to write deep scan HTML: {e}")
+        
+        # Generate IOC database
+        ioc_html = generate_ioc_database(deep_scan_data, timestamp)
+        try:
+            with open(IOC_DATABASE, 'w') as f:
+                f.write(ioc_html)
+            print(f"[+] IOC database generated with {intel_summary['total_iocs']} IOCs")
+        except Exception as e:
+            print(f"[!] Failed to write IOC database: {e}")
+    
+    # Check if links should appear
+    has_deep_scans = any(target.get('deep_scan', False) for target in TARGETS)
+    deep_scan_link = ''
+    ioc_link = ''
+    alert_stats_link = ''
+    trends_link = ''
+    threat_feed_link = ''
+    if has_deep_scans and os.path.exists(DEEP_SCAN_DB):
+        deep_scan_link = ' | <a href="deep_scan_results.html" class="intel-link">Deep Scan Database</a>'
+    if has_deep_scans and os.path.exists(IOC_DATABASE):
+        ioc_link = ' | <a href="ioc_database.html" class="intel-link">IOC Database</a>'
+    if os.path.exists("/var/www/html/alert_statistics.html"):
+        alert_stats_link = ' | <a href="alert_statistics.html" class="intel-link">Alert Statistics</a>'
+    if os.path.exists("/var/www/html/historical_trends.html"):
+        trends_link = ' | <a href="historical_trends.html" class="intel-link">Historical Trends</a>'
+    if os.path.exists("/var/www/html/threat_feeds.html"):
+        threat_feed_link = ' | <a href="threat_feeds.html" class="intel-link">Threat Intel Feeds</a>'
+    
+    # Generate HTML with Intelligence Summary Dashboard
+    html_content = f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Dark Web Observatory - Threat Intelligence Platform</title>
+        <meta charset="UTF-8">
+        <meta http-equiv="refresh" content="300"> 
+        <style>
+            body {{ font-family: 'Courier New', monospace; background: #0d0d0d; color: #e0e0e0; padding: 20px; }}
+            h1 {{ color: #00ff00; text-transform: uppercase; border-bottom: 2px solid #333; padding-bottom: 10px; }}
+            
+            .intel-summary {{
+                background: #1a1a1a;
+                border: 2px solid #00ff00;
+                padding: 25px;
+                margin: 20px 0;
+                border-radius: 5px;
+            }}
+            .intel-summary h2 {{
+                color: #00ff00;
+                margin: 0 0 20px 0;
+                font-size: 1.2em;
+                text-transform: uppercase;
+            }}
+            .metrics-grid {{
+                display: grid;
+                grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+                gap: 15px;
+                margin-bottom: 20px;
+            }}
+            .metric-box {{
+                background: #0a0a0a;
+                padding: 15px;
+                border-left: 3px solid #333;
+                transition: all 0.3s;
+                cursor: default;
+            }}
+            .metric-box.clickable {{
+                cursor: pointer;
+            }}
+            .metric-box.clickable:hover {{
+                border-left-color: #00ff00;
+                background: #111;
+            }}
+            .metric-label {{
+                color: #888;
+                font-size: 0.85em;
+                text-transform: uppercase;
+                margin-bottom: 5px;
+            }}
+            .metric-value {{
+                color: #00ff00;
+                font-size: 1.8em;
+                font-weight: bold;
+            }}
+            .metric-value.warning {{ color: #ffa500; }}
+            .metric-value.danger {{ color: #ff3333; }}
+            
+            .category-filters {{
+                margin-top: 20px;
+                padding-top: 15px;
+                border-top: 1px solid #333;
+            }}
+            .filter-label {{
+                color: #888;
+                font-size: 0.85em;
+                text-transform: uppercase;
+                margin-bottom: 10px;
+            }}
+            .category-breakdown {{
+                display: flex;
+                flex-wrap: wrap;
+                gap: 10px;
+            }}
+            .category-tag {{
+                background: #0a0a0a;
+                padding: 8px 15px;
+                border-radius: 3px;
+                font-size: 0.9em;
+                border: 1px solid #333;
+                cursor: pointer;
+                transition: all 0.3s;
+            }}
+            .category-tag:hover {{
+                border-color: #00ff00;
+                background: #111;
+            }}
+            .category-tag.active {{
+                background: #003300;
+                border-color: #00ff00;
+                color: #00ff00;
+            }}
+            .category-tag .count {{
+                color: #00ff00;
+                font-weight: bold;
+                margin-left: 5px;
+            }}
+            
+            .category {{ color: #888; font-size: 0.8em; text-transform: uppercase; }}
+            table {{ border-collapse: collapse; width: 100%; max-width: 2000px; margin-top: 20px; font-size: 0.9em; }}
+            th, td {{ border: 1px solid #333; padding: 12px; text-align: left; vertical-align: middle; }}
+            th {{ background-color: #1a1a1a; color: #fff; text-transform: uppercase; letter-spacing: 1px; }}
+            tr:nth-child(even) {{ background-color: #111; }}
+            tr.hidden {{ display: none; }}
+            a {{ color: #888; text-decoration: none; }}
+            a:hover {{ color: #fff; text-decoration: underline; }}
+            .green {{ color: #00ff00; font-weight: bold; background-color: #001a00; text-align: center; }}
+            .orange {{ color: #ffa500; font-weight: bold; background-color: #1a1000; text-align: center; }}
+            .red {{ color: #ff3333; font-weight: bold; background-color: #1a0000; text-align: center; }}
+            .small {{ font-size: 0.85em; color: #999; }}
+            .title-text {{ font-style: italic; color: #aaa; }}
+            .deep-scan-badge {{ background: #003300; color: #00ff00; padding: 2px 6px; border-radius: 3px; font-size: 0.75em; }}
+            .change-badge {{ background: #1a1000; color: #ffa500; padding: 2px 6px; border-radius: 3px; font-size: 0.75em; margin-left: 5px; animation: pulse 2s infinite; }}
+            @keyframes pulse {{
+                0%, 100% {{ opacity: 1; }}
+                50% {{ opacity: 0.5; }}
+            }}
+            .intel-link {{ color: #00aaff; text-decoration: underline; cursor: pointer; }}
+            .view-report-btn {{ background: #003300; color: #00ff00; padding: 4px 10px; border: 1px solid #00ff00; text-decoration: none; font-size: 0.85em; display: inline-block; }}
+            .view-report-btn:hover {{ background: #004400; color: #fff; }}
+            .uptime-bar {{
+                width: 100%;
+                height: 18px;
+                background: #1a0000;
+                border-radius: 3px;
+                overflow: hidden;
+                position: relative;
+            }}
+            .uptime-fill {{
+                height: 100%;
+                background: linear-gradient(90deg, #ff3333 0%, #ffa500 50%, #00ff00 100%);
+                transition: width 0.3s;
+            }}
+            .uptime-text {{
+                position: absolute;
+                top: 0;
+                left: 0;
+                right: 0;
+                text-align: center;
+                line-height: 18px;
+                font-size: 0.8em;
+                font-weight: bold;
+                color: #fff;
+                text-shadow: 1px 1px 2px #000;
+            }}
+        </style>
+    </head>
+    <body>
+        <h1>Dark Web Observatory - Threat Intelligence Platform</h1>
+        <p>Last Scan: {timestamp} | <a href="intelligence.json" class="intel-link">Download Intel Feed (JSON)</a>{deep_scan_link}{ioc_link}{alert_stats_link}{trends_link}{threat_feed_link}</p>
+        
+        <div class="intel-summary">
+            <h2>📊 Intelligence Summary (Last Scan)</h2>
+            <div class="metrics-grid">
+                <div class="metric-box">
+                    <div class="metric-label">Total Targets</div>
+                    <div class="metric-value">{intel_summary['total_targets']}</div>
+                </div>
+                <div class="metric-box">
+                    <div class="metric-label">Targets UP</div>
+                    <div class="metric-value">{intel_summary['up_targets']}</div>
+                </div>
+                <div class="metric-box clickable" onclick="window.location.href='deep_scan_results.html'" title="Click to view deep scan database">
+                    <div class="metric-label">Deep Scans Active</div>
+                    <div class="metric-value">{intel_summary['deep_scan_count']}</div>
+                </div>
+                <div class="metric-box {'clickable' if intel_summary['total_iocs'] > 0 else ''}" {('onclick="window.location.href=\'ioc_database.html\'" title="Click to view IOC database"' if intel_summary['total_iocs'] > 0 else '')}>
+                    <div class="metric-label">IOCs Discovered</div>
+                    <div class="metric-value {'danger' if intel_summary['total_iocs'] > 0 else ''}">{intel_summary['total_iocs']}</div>
+                </div>
+                <div class="metric-box {'clickable' if intel_summary['total_emails'] > 0 else ''}" {('onclick="window.location.href=\'ioc_database.html\'" title="Click to view emails"' if intel_summary['total_emails'] > 0 else '')}>
+                    <div class="metric-label">Email Addresses</div>
+                    <div class="metric-value danger">{intel_summary['total_emails']}</div>
+                </div>
+                <div class="metric-box {'clickable' if intel_summary['total_btc'] > 0 else ''}" {('onclick="window.location.href=\'ioc_database.html\'" title="Click to view Bitcoin addresses"' if intel_summary['total_btc'] > 0 else '')}>
+                    <div class="metric-label">Bitcoin Addresses</div>
+                    <div class="metric-value danger">{intel_summary['total_btc']}</div>
+                </div>
+                <div class="metric-box {'clickable' if intel_summary['total_pgp'] > 0 else ''}" {('onclick="window.location.href=\'ioc_database.html\'" title="Click to view PGP keys"' if intel_summary['total_pgp'] > 0 else '')}>
+                    <div class="metric-label">PGP Keys</div>
+                    <div class="metric-value danger">{intel_summary['total_pgp']}</div>
+                </div>
+                <div class="metric-box {'clickable' if intel_summary['changes_detected'] > 0 else ''}" {('title="Changes detected on monitored targets"' if intel_summary['changes_detected'] > 0 else '')}>
+                    <div class="metric-label">Changes Detected</div>
+                    <div class="metric-value {'warning' if intel_summary['changes_detected'] > 0 else ''}">{intel_summary['changes_detected']}</div>
+                </div>
+                <div class="metric-box">
+                    <div class="metric-label">Avg Response Time</div>
+                    <div class="metric-value">{intel_summary['avg_latency']}s</div>
+                </div>
+            </div>
+            
+            <div class="category-filters">
+                <div class="filter-label">Filter by Category:</div>
+                <div class="category-breakdown">
+                    <div class="category-tag active" onclick="filterCategory('all')" data-category="all">
+                        ALL TARGETS <span class="count">{intel_summary['total_targets']}</span>
+                    </div>
+"""
+    
+    # Add category filters
+    for cat, count in sorted(intel_summary['categories'].items()):
+        html_content += f'''
+                    <div class="category-tag" onclick="filterCategory('{cat}')" data-category="{cat}">
+                        {cat.upper()} <span class="count">{count}</span>
+                    </div>'''
+    
+    html_content += """
+                </div>
+            </div>
+        </div>
+        
+        <table id="targetsTable">
+            <thead>
+                <tr>
+                    <th style="width: 10%">Target Name</th>
+                    <th style="width: 22%">Onion Address</th>
+                    <th style="width: 6%">Status</th>
+                    <th style="width: 9%">Uptime (24h)</th>
+                    <th style="width: 5%">Latency</th>
+                    <th style="width: 8%">Server</th>
+                    <th style="width: 10%">Last Changed</th>
+                    <th style="width: 18%">Page Title / Error</th>
+                    <th style="width: 12%">Deep Scan</th>
+                </tr>
+            </thead>
+            <tbody>
+    """
+
+    # Build table rows
+    for item in all_results:
+        target_name = item['name']
+        target_url = item['url']
+        target_category = item['category']
+        result = item['result']
+        deep_scan_enabled = item['deep_scan_enabled']
+        uptime_24h = item['uptime_24h']
+        change_info = item.get('change_info', {})
+        
+        deep_badge = ' <span class="deep-scan-badge">DEEP SCAN</span>' if deep_scan_enabled else ''
+        
+        # Change badge
+        if change_info.get('changed'):
+            change_type = change_info.get('change_type', 'unknown')
+            change_badge = f' <span class="change-badge" title="Changed: {change_type}">{change_type.upper()}</span>'
+        else:
+            change_badge = ''
+        
+        # Uptime bar
+        uptime_cell = f'''
+            <div class="uptime-bar">
+                <div class="uptime-fill" style="width: {uptime_24h}%;"></div>
+                <div class="uptime-text">{uptime_24h}%</div>
+            </div>
+        '''
+        
+        # Status
+        status_display = result['status']
+        if result.get('status_detail'):
+            status_detail = result['status_detail']
+            status_display = f'<span title="{status_detail}">{result["status"]}</span>'
+        
+        # Last changed
+        if change_info.get('changed'):
+            now_obj = datetime.datetime.now()
+            last_changed_time = now_obj.strftime('%m-%d %H:%M')
+            last_changed_cell = f'<span style="color: #ffa500;">{last_changed_time}</span>'
+        else:
+            last_changed_cell = '<span style="color: #555;">-</span>'
+        
+        # Deep scan column
+        if deep_scan_enabled:
+            filename = sanitize_filename(target_name)
+            deep_scan_cell = f'<a href="deep_scans/{filename}.html" class="view-report-btn">View Report →</a>'
+        else:
+            deep_scan_cell = '<span style="color: #555;">Not enabled</span>'
+        
+        html_content += f"""
+            <tr data-category="{target_category}">
+                <td><span class="category">[{target_category}]</span><br>{target_name}{deep_badge}{change_badge}</td>
+                <td class="small"><a href="{target_url}">{target_url}</a></td>
+                <td class="{result['color']}">{status_display}</td>
+                <td>{uptime_cell}</td>
+                <td style="text-align: center;">{result['latency']}</td>
+                <td class="small">{result['server']}</td>
+                <td style="text-align: center;">{last_changed_cell}</td>
+                <td class="title-text">{result['title']}</td>
+                <td style="text-align: center;">{deep_scan_cell}</td>
+            </tr>
+        """
+
+    html_content += """
+            </tbody>
+        </table>
+
+        <div class="news-widget" style="margin-top: 40px; padding: 20px; background: #1a1a1a; border-left: 4px solid #ffa500;">
+            <h2 style="color: #ffa500; margin-top: 0;">📰 Latest Cybersecurity News</h2>
+            <div id="news-feed-container">
+                <p style="color: #888;">Loading news feed...</p>
+            </div>
+        </div>
+
+        <script>
+        fetch('news_feed.json')
+            .then(response => response.json())
+            .then(data => {
+                const container = document.getElementById('news-feed-container');
+                const articles = data.articles.slice(0, 5); // Show top 5
+                
+                if (!articles || articles.length === 0) {
+                    container.innerHTML = '<p style="color: #888;">No news available.</p>';
+                    return;
+                }
+                
+                let html = '<div style="display: grid; gap: 15px; margin-top: 15px;">';
+                
+                articles.forEach(article => {
+                    // Simple cleanup
+                    const title = article.title;
+                    const desc = article.description.substring(0, 150) + '...';
+                    const link = article.link;
+                    const source = article.source;
+                    
+                    html += `
+                        <div style="background: #0d0d0d; padding: 15px; border: 1px solid #333;">
+                            <div style="display: flex; justify-content: space-between;">
+                                <a href="${link}" target="_blank" style="color: #00aaff; font-weight: bold; text-decoration: none;">${title}</a>
+                                <span style="color: #666; font-size: 0.8em;">${source}</span>
+                            </div>
+                            <p style="color: #ccc; font-size: 0.9em; margin: 8px 0;">${desc}</p>
+                        </div>
+                    `;
+                });
+                
+                html += '</div>';
+                container.innerHTML = html;
+            })
+            .catch(err => {
+                console.error('News feed error:', err);
+                document.getElementById('news-feed-container').innerHTML = 
+                    '<p style="color: #ff3333;">Could not load news feed (ensure news_feed.json exists).</p>';
+            });
+        </script>
+        <p style="margin-top:50px; font-size: 0.8em; color: #555;">
+            <i>Automated Threat Intelligence Sentinel | Ubuntu 25.04 | Powered by Tor Network</i>
+        </p>
+        
+        <script>
+        let currentCategory = 'all';
+        
+        function filterCategory(category) {
+            currentCategory = category;
+            
+            document.querySelectorAll('.category-tag').forEach(tag => {
+                if (tag.dataset.category === category) {
+                    tag.classList.add('active');
+                } else {
+                    tag.classList.remove('active');
+                }
+            });
+            
+            const rows = document.querySelectorAll('#targetsTable tbody tr');
+            rows.forEach(row => {
+                if (category === 'all' || row.dataset.category === category) {
+                    row.classList.remove('hidden');
+                } else {
+                    row.classList.add('hidden');
+                }
+            });
+        }
+        </script>
+    </body>
+    </html>
+    """
+
+    # Write HTML
+    try:
+        with open(OUTPUT_HTML, "w") as f:
+            f.write(html_content)
+        print(f"[+] Dashboard updated")
+    except PermissionError:
+        print("[!] Error: Cannot write to /var/www/html")
+    
+    # Write JSON feed
+    try:
+        intel_feed = {
+            'scan_timestamp': timestamp,
+            'total_targets': len(TARGETS),
+            'intelligence_summary': intel_summary,
+            'targets': []
+        }
+        
+        for item in all_results:
+            target_data = {k: v for k, v in item.items() if k != 'result'}
+            if item['deep_scan_enabled']:
+                filename = sanitize_filename(item['name'])
+                target_data['deep_scan_report_url'] = f"deep_scans/{filename}.html"
+                target_data['deep_scan_json_url'] = f"deep_scan_results.json"
+            intel_feed['targets'].append(target_data)
+        
+        with open(OUTPUT_JSON, 'w') as f:
+            json.dump(intel_feed, f, indent=2)
+        print(f"[+] Intelligence feed generated")
+    except Exception as e:
+        print(f"[!] Failed to write intelligence feed: {e}")
+    
+    print(f"\n[✓] Scan complete! Dashboard: http://localhost/")
+
+
+    # Generate alert statistics dashboard
+    try:
+        from generate_alert_stats import generate_alert_statistics
+        generate_alert_statistics()
+    except Exception as e:
+        print(f"[!] Failed to generate alert statistics: {e}")
+    
+    # Generate historical trends dashboard
+    try:
+        from generate_historical_trends import generate_historical_trends
+        generate_historical_trends()
+    except Exception as e:
+        print(f"[!] Failed to generate historical trends: {e}")
+    
+    # Generate news feed
+    try:
+        from news_feed_aggregator import aggregate_news_feed
+        aggregate_news_feed()
+    except Exception as e:
+        print(f"[!] Failed to generate news feed: {e}")
+
+if __name__ == "__main__":
+    generate_report()

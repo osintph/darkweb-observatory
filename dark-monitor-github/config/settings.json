@@ -1,0 +1,20 @@
+{
+  "output_html":      "/var/www/html/index.html",
+  "tor_socks_host":   "127.0.0.1",
+  "tor_socks_port":   9050,
+  "request_timeout":  10,
+  "max_workers":      25,
+  "refresh_seconds":  300,
+  "history_max_rows": 100,
+  "remote_sources": {
+    "cache_hours": 24,
+    "alecmuffett": {
+      "enabled": true,
+      "url": "https://raw.githubusercontent.com/alecmuffett/real-world-onion-sites/master/README.md"
+    },
+    "deepdarkCTI": {
+      "enabled": true,
+      "url": "https://raw.githubusercontent.com/fastfire/deepdarkCTI/main/ransomware_gang.md"
+    }
+  }
+}

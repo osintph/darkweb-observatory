@@ -1,0 +1,282 @@
+# SIMPLE INTEGRATION PATCH
+# Just add these snippets to your existing advanced_scanner.py
+
+====================================================================
+STEP 1: Add CSS (around line 200, inside the <style> section)
+====================================================================
+
+Add this CSS before the closing </style> tag:
+
+```css
+/* NEW FEATURES: On-Demand Scanner + News Refresh */
+.on-demand-scanner {
+    margin: 40px 0;
+    padding: 25px;
+    background: #1a1a1a;
+    border-left: 4px solid #00aaff;
+    border-radius: 5px;
+}
+.on-demand-scanner h2 {
+    color: #00aaff;
+    margin: 0 0 10px 0;
+    font-size: 1.4em;
+    text-transform: uppercase;
+}
+.scanner-input-row {
+    display: flex;
+    gap: 10px;
+}
+.ondemand-input {
+    flex: 1;
+    background: #0a0a0a;
+    border: 1px solid #333;
+    color: #e0e0e0;
+    padding: 12px 15px;
+    font-family: 'Courier New', monospace;
+    font-size: 1em;
+}
+.ondemand-input:focus {
+    border-color: #00aaff;
+    outline: none;
+}
+.scan-btn {
+    background: #003366;
+    border: 1px solid #00aaff;
+    color: #00aaff;
+    padding: 12px 24px;
+    cursor: pointer;
+    font-family: 'Courier New', monospace;
+    font-size: 1em;
+    font-weight: bold;
+    transition: all 0.3s;
+}
+.scan-btn:hover {
+    background: #004488;
+}
+.scan-btn:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+}
+.scan-result-card {
+    background: #0a0a0a;
+    border: 1px solid #333;
+    padding: 20px;
+    margin-top: 15px;
+    border-left: 3px solid #00ff00;
+}
+.scan-error-card {
+    background: #1a0000;
+    border: 1px solid #ff3333;
+    padding: 20px;
+    color: #ff3333;
+    border-left: 3px solid #ff3333;
+}
+.refresh-news-btn {
+    background: #1a1000;
+    border: 1px solid #ffa500;
+    color: #ffa500;
+    padding: 8px 16px;
+    cursor: pointer;
+    font-family: 'Courier New', monospace;
+    font-size: 0.9em;
+    transition: all 0.3s;
+}
+.refresh-news-btn:hover {
+    background: #2a2000;
+}
+.refresh-news-btn:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+}
+```
+
+====================================================================
+STEP 2: Add On-Demand Scanner HTML 
+====================================================================
+
+Find the line (around line 850):
+    </table>
+
+Right AFTER that </table> closing tag (before the news widget), add:
+
+```html
+        <div class="on-demand-scanner">
+            <h2>🔍 On-Demand Deep Scan</h2>
+            <p style="color: #888; margin-bottom: 15px;">Enter any .onion URL to perform a one-time deep scan and generate an instant report.</p>
+            
+            <div class="scanner-input-row">
+                <input 
+                    type="text" 
+                    id="ondemandUrl" 
+                    class="ondemand-input" 
+                    placeholder="http://example.onion or https://example.onion"
+                    onkeypress="if(event.key==='Enter') startOnDemandScan()"
+                >
+                <button onclick="startOnDemandScan()" id="scanBtn" class="scan-btn">
+                    Scan Now →
+                </button>
+            </div>
+            
+            <div id="scanStatus" style="margin-top: 15px; display: none;"></div>
+            <div id="scanResults" style="margin-top: 20px;"></div>
+        </div>
+```
+
+====================================================================
+STEP 3: Modify News Widget Header
+====================================================================
+
+Find this line (around line 890):
+                <h2 class="news-title">📰 Latest Cybersecurity News</h2>
+
+Replace it with:
+
+```html
+                <div style="display: flex; justify-content: space-between; align-items: center;">
+                    <h2 class="news-title" style="margin: 0;">📰 Latest Cybersecurity News</h2>
+                    <button onclick="refreshNewsFeed()" id="refreshNewsBtn" class="refresh-news-btn">
+                        🔄 Refresh Feed
+                    </button>
+                </div>
+```
+
+====================================================================
+STEP 4: Add JavaScript Functions
+====================================================================
+
+Find the closing </script> tag near the end (around line 1090)
+
+Right BEFORE that </script> tag, add these two functions:
+
+```javascript
+// ON-DEMAND SCANNER
+function startOnDemandScan() {
+    const url = document.getElementById('ondemandUrl').value.trim();
+    const btn = document.getElementById('scanBtn');
+    const statusDiv = document.getElementById('scanStatus');
+    const resultsDiv = document.getElementById('scanResults');
+    
+    if (!url) {
+        alert('Please enter a .onion URL');
+        return;
+    }
+    
+    if (!url.includes('.onion')) {
+        alert('Invalid URL: Must be a .onion address');
+        return;
+    }
+    
+    btn.disabled = true;
+    btn.innerHTML = '⏳ Scanning...';
+    statusDiv.style.display = 'block';
+    statusDiv.innerHTML = '<p style="color: #ffa500;">🔄 Scanning target... This may take up to 90 seconds.</p>';
+    resultsDiv.innerHTML = '';
+    
+    fetch('/cgi-bin/on_demand_scan.py', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({ url: url })
+    })
+    .then(response => response.json())
+    .then(data => {
+        btn.disabled = false;
+        btn.innerHTML = 'Scan Now →';
+        statusDiv.style.display = 'none';
+        
+        if (data.success) {
+            displayScanResults(data);
+        } else {
+            resultsDiv.innerHTML = '<div class="scan-error-card"><h3 style="margin-top: 0;">❌ Scan Failed</h3><p><strong>Error:</strong> ' + data.error + '</p></div>';
+        }
+    })
+    .catch(error => {
+        btn.disabled = false;
+        btn.innerHTML = 'Scan Now →';
+        statusDiv.style.display = 'none';
+        resultsDiv.innerHTML = '<div class="scan-error-card"><h3>❌ Request Failed</h3><p>' + error.message + '</p></div>';
+    });
+}
+
+function displayScanResults(data) {
+    const resultsDiv = document.getElementById('scanResults');
+    const timestamp = new Date(data.timestamp).toLocaleString();
+    
+    let html = '<div class="scan-result-card"><h3 style="color: #00ff00; margin-top: 0;">✓ Scan Complete</h3>';
+    html += '<div style="margin: 15px 0; padding: 10px; background: #0d0d0d; border-left: 3px solid #333;">';
+    html += '<p style="margin: 5px 0;"><strong>URL:</strong> ' + data.url + '</p>';
+    html += '<p style="margin: 5px 0;"><strong>Scanned:</strong> ' + timestamp + '</p>';
+    html += '<p style="margin: 5px 0;"><strong>HTTP Status:</strong> ' + data.http_code + '</p>';
+    html += '<p style="margin: 5px 0;"><strong>Page Title:</strong> ' + data.title + '</p></div>';
+    
+    html += '<div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; margin: 20px 0;">';
+    html += '<div style="background: #0d0d0d; padding: 12px; text-align: center; border: 1px solid #333;"><div style="color: #888; font-size: 0.85em;">EMAILS</div><div style="color: ' + (data.emails.length > 0 ? '#ff3333' : '#00ff00') + '; font-size: 1.5em; font-weight: bold;">' + data.emails.length + '</div></div>';
+    html += '<div style="background: #0d0d0d; padding: 12px; text-align: center; border: 1px solid #333;"><div style="color: #888; font-size: 0.85em;">BITCOIN</div><div style="color: ' + (data.bitcoin_addresses.length > 0 ? '#ff3333' : '#00ff00') + '; font-size: 1.5em; font-weight: bold;">' + data.bitcoin_addresses.length + '</div></div>';
+    html += '<div style="background: #0d0d0d; padding: 12px; text-align: center; border: 1px solid #333;"><div style="color: #888; font-size: 0.85em;">LINKED ONIONS</div><div style="color: #00aaff; font-size: 1.5em; font-weight: bold;">' + data.linked_onions.length + '</div></div>';
+    html += '<div style="background: #0d0d0d; padding: 12px; text-align: center; border: 1px solid #333;"><div style="color: #888; font-size: 0.85em;">TECHNOLOGIES</div><div style="color: #00ff00; font-size: 1.5em; font-weight: bold;">' + data.technologies.length + '</div></div></div>';
+    
+    if (data.emails.length > 0) {
+        html += '<h4 style="color: #ffa500; margin-top: 20px;">📧 Email Addresses</h4><div style="background: #0d0d0d; padding: 10px;">';
+        data.emails.forEach(email => { html += '<div style="padding: 5px; color: #ff3333;">• ' + email + '</div>'; });
+        html += '</div>';
+    }
+    
+    if (data.bitcoin_addresses.length > 0) {
+        html += '<h4 style="color: #ffa500; margin-top: 20px;">₿ Bitcoin Addresses</h4><div style="background: #0d0d0d; padding: 10px;">';
+        data.bitcoin_addresses.forEach(btc => { html += '<div style="padding: 5px; color: #ff3333;">• ' + btc + '</div>'; });
+        html += '</div>';
+    }
+    
+    if (data.linked_onions.length > 0) {
+        html += '<h4 style="color: #ffa500; margin-top: 20px;">🧅 Linked Onions</h4><div style="background: #0d0d0d; padding: 10px;">';
+        data.linked_onions.forEach(onion => { html += '<div style="padding: 5px; color: #00aaff;">• ' + onion + '</div>'; });
+        html += '</div>';
+    }
+    
+    html += '<p style="margin-top: 25px; padding-top: 15px; border-top: 1px solid #333; color: #666; font-size: 0.85em;"><em>One-time scan. Not stored.</em></p></div>';
+    resultsDiv.innerHTML = html;
+}
+
+// NEWS REFRESH
+function refreshNewsFeed() {
+    const btn = document.getElementById('refreshNewsBtn');
+    const originalText = btn.innerHTML;
+    
+    btn.disabled = true;
+    btn.innerHTML = '⏳ Refreshing...';
+    
+    fetch('/cgi-bin/refresh_news.py', {method: 'POST'})
+    .then(response => response.json())
+    .then(data => {
+        if (data.success) {
+            btn.innerHTML = '✓ Updated!';
+            setTimeout(() => { location.reload(); }, 1000);
+        } else {
+            btn.innerHTML = '✗ Failed';
+            setTimeout(() => { btn.innerHTML = originalText; btn.disabled = false; }, 2000);
+        }
+    })
+    .catch(error => {
+        btn.innerHTML = '✗ Error';
+        setTimeout(() => { btn.innerHTML = originalText; btn.disabled = false; }, 2000);
+    });
+}
+```
+
+====================================================================
+DONE! Now install the backend files:
+====================================================================
+
+Run this in your terminal:
+
+```bash
+cd ~/dark-monitor
+bash install_features.sh
+```
+
+Then regenerate your dashboard:
+
+```bash
+./run_scanner.sh
+```
+
+That's it! The features will now work.
