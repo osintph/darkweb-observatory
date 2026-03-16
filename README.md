@@ -38,7 +38,7 @@ Targets with `deep_scan: true` get full IOC extraction on every scan:
 ## Quick Deploy (Fresh Ubuntu 22.04 / 24.04)
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/dark-onion-monitor.git
+git clone https://github.com/osintph/dark-observatory.git
 cd dark-onion-monitor
 bash deploy.sh
 ```
