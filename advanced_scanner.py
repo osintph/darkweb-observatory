@@ -532,7 +532,7 @@ def generate_report(targets_override=None):
       allNews=d.articles||[];
       const c=document.getElementById('newsFilters');
       const cats=[...new Set(allNews.map(a=>a.category))].filter(Boolean);
-      c.innerHTML='<button class="active" onclick="filt(\'all\')">ALL</button>';
+      c.innerHTML='<button class="active" onclick="filt(&quot;all&quot;)">ALL</button>';
       cats.forEach(x=>c.innerHTML+=`<button onclick="filt('${x}')">${x.toUpperCase()}</button>`);
       render(allNews.slice(0,20));
   }).catch(()=>document.getElementById('news-feed-container').innerHTML='Feed unavailable.');
